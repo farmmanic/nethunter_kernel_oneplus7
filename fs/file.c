@@ -24,8 +24,6 @@
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 
-#define FD_OVER_CHECK
-
 unsigned int sysctl_nr_open __read_mostly = 1024*1024;
 unsigned int sysctl_nr_open_min = BITS_PER_LONG;
 /* our min() is unusable in constant expressions ;-/ */
@@ -481,136 +479,6 @@ static unsigned int find_next_fd(struct fdtable *fdt, unsigned int start)
 	return find_next_zero_bit(fdt->open_fds, maxfd, start);
 }
 
-#ifdef FD_OVER_CHECK
-#define FD_CHECK_NAME_SIZE 256
-// Declare a radix tree to construct fd set tree
-static RADIX_TREE(over_fd_tree, GFP_KERNEL);
-static LIST_HEAD(fd_listhead);
-static DEFINE_MUTEX(over_fd_mutex);
-struct over_fd_entry {
-	int num_of_fd;
-	char name[FD_CHECK_NAME_SIZE];
-	int hash;
-	struct list_head fd_link;
-};
-
-/*
-* Get File Name from FD value
-*/
-long get_file_name_from_fd(struct files_struct *files, int fd, int procid, struct over_fd_entry *res_name)
-{
-	char *tmp;
-	char *pathname;
-	struct file *file;
-	struct path path;
-	spin_lock(&files->file_lock);
-	file = fget(fd);
-	if (!file) {
-        spin_unlock(&files->file_lock);
-        return (long)NULL;
-	}
-	path_get(&file->f_path);
-	path = file->f_path;
-	fput(file);
-	spin_unlock(&files->file_lock);
-	tmp = (char *)__get_free_page(__GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_RECLAIMABLE);
-	if (!tmp) {
-        return (long)NULL;
-	}
-	pathname = d_path(&path, tmp, PAGE_SIZE);
-
-	path_put(&path);
-	if (IS_ERR(pathname))
-	{
-        free_page((unsigned long)tmp);
-	    return PTR_ERR(pathname);
-	}  /* do something here with pathname */
-	if(pathname!=NULL)
-	{
-	    strncpy(res_name->name, pathname, FD_CHECK_NAME_SIZE - 1);
-	}
-	free_page((unsigned long)tmp);
-	return 1;
-}
-
-unsigned int get_hash(char *name)
-{
-    return full_name_hash(NULL,name, strlen(name));
-}
-
-static struct over_fd_entry* fd_lookup(unsigned int hash)
-{
-    return radix_tree_lookup(&over_fd_tree, hash);
-}
-
-static void fd_insert(struct over_fd_entry *entry)
-{
-	unsigned int hash = get_hash(entry->name);
-	struct over_fd_entry *find_entry = fd_lookup(hash);
-
-	if(!find_entry)	// Can't find the element, just add the element
-	{
-		entry->num_of_fd = 1;
-		entry->hash = hash;
-		list_add_tail(&entry->fd_link, &fd_listhead);
-		radix_tree_insert(&over_fd_tree, hash, (void *)entry);
-	}
-	else	// Cover the original element
-	{
-		find_entry->num_of_fd = find_entry->num_of_fd+1;
-		kfree(entry);
-	}
-}
-
-static void fd_delete(unsigned int hash)
-{
-	radix_tree_delete(&over_fd_tree, hash);
-}
-
-void fd_show_open_files(pid_t pid, struct files_struct *files, struct fdtable *fdt)
-{
-    int i=0;
-	struct over_fd_entry *lentry;
-	long result;
-	int num_of_entry;
-	int sum_fds_of_pid = 0;
-
-    mutex_lock(&over_fd_mutex);
-    for(i=0; i<fdt->max_fds; i++) {
-        struct over_fd_entry *entry = (struct over_fd_entry*)kzalloc(sizeof(struct over_fd_entry), GFP_KERNEL);
-        if(!entry) {
-           printk("[FD_LEAK](PID:%d)Empty FD:%d", pid, i);
-        }
-        else {
-            memset(entry->name, 0, sizeof entry->name);
-            result = get_file_name_from_fd(files, i, pid, entry);
-            if(result==1) {
-               fd_insert(entry);
-               sum_fds_of_pid++;
-            }
-        }
-    }
-    for(;;) {
-       if(list_empty(&fd_listhead)) {
-           break;
-        }
-        lentry = list_entry((&fd_listhead)->next, struct over_fd_entry, fd_link);
-        num_of_entry = lentry->num_of_fd;
-        if(lentry != NULL && lentry->name!=NULL)
-           printk("[FD_LEAK]OverAllocFDError(PID:%d fileName:%s Num:%d)\n", pid, lentry->name, num_of_entry);
-        else
-           printk("[FD_LEAK]OverAllocFDError(PID:%d fileName:%s Num:%d)\n", pid, "NULL", num_of_entry);
-        list_del((&fd_listhead)->next);
-        fd_delete(lentry->hash);
-        kfree(lentry);
-    }
-    if(sum_fds_of_pid) {
-        printk("[FD_LEAK]OverAllocFDError(PID:%d totalFDs:%d)\n", pid, sum_fds_of_pid);
-    }
-    mutex_unlock(&over_fd_mutex);
-}
-#endif
-
 /*
  * allocate a file descriptor, mark it busy.
  */
@@ -669,17 +537,6 @@ repeat:
 
 out:
 	spin_unlock(&files->file_lock);
-#ifdef FD_OVER_CHECK
-	if(error == -EMFILE) {
-	    // every process just dump only one time
-	    if(current->group_leader->dump_fd_leak==false)
-	    {
-	        current->group_leader->dump_fd_leak = true;
-	        printk("[FD_LEAK](PID:%d)fd over RLIMIT_NOFILE:%ld", current->pid, rlimit(RLIMIT_NOFILE));
-	        fd_show_open_files(current->pid, files, fdt);
-        }
-	}
-#endif
 	return error;
 }
 
@@ -822,28 +679,69 @@ void do_close_on_exec(struct files_struct *files)
 	spin_unlock(&files->file_lock);
 }
 
+static inline struct file *__fget_files_rcu(struct files_struct *files,
+		unsigned int fd, fmode_t mask, unsigned int refs)
+{
+	for (;;) {
+		struct file *file;
+		struct fdtable *fdt = rcu_dereference_raw(files->fdt);
+		struct file __rcu **fdentry;
+
+		if (unlikely(fd >= fdt->max_fds))
+			return NULL;
+
+		fdentry = fdt->fd + array_index_nospec(fd, fdt->max_fds);
+		file = rcu_dereference_raw(*fdentry);
+		if (unlikely(!file))
+			return NULL;
+
+		if (unlikely(file->f_mode & mask))
+			return NULL;
+
+		/*
+		 * Ok, we have a file pointer. However, because we do
+		 * this all locklessly under RCU, we may be racing with
+		 * that file being closed.
+		 *
+		 * Such a race can take two forms:
+		 *
+		 *  (a) the file ref already went down to zero,
+		 *      and get_file_rcu_many() fails. Just try
+		 *      again:
+		 */
+		if (unlikely(!get_file_rcu_many(file, refs)))
+			continue;
+
+		/*
+		 *  (b) the file table entry has changed under us.
+		 *       Note that we don't need to re-check the 'fdt->fd'
+		 *       pointer having changed, because it always goes
+		 *       hand-in-hand with 'fdt'.
+		 *
+		 * If so, we need to put our refs and try again.
+		 */
+		if (unlikely(rcu_dereference_raw(files->fdt) != fdt) ||
+		    unlikely(rcu_dereference_raw(*fdentry) != file)) {
+			fput_many(file, refs);
+			continue;
+		}
+
+		/*
+		 * Ok, we have a ref to the file, and checked that it
+		 * still exists.
+		 */
+		return file;
+	}
+}
+
+
 static struct file *__fget(unsigned int fd, fmode_t mask, unsigned int refs)
 {
 	struct files_struct *files = current->files;
 	struct file *file;
 
 	rcu_read_lock();
-loop:
-	file = fcheck_files(files, fd);
-	if (file) {
-		/* File object ref couldn't be taken.
-		 * dup2() atomicity guarantee is the reason
-		 * we loop to catch the new file (or NULL pointer)
-		 */
-		if (file->f_mode & mask)
-			file = NULL;
-		else if (!get_file_rcu_many(file, refs))
-			goto loop;
-		else if (__fcheck_files(files, fd) != file) {
-			fput_many(file, refs);
-			goto loop;
-		}
-	}
+	file = __fget_files_rcu(files, fd, mask, refs);
 	rcu_read_unlock();
 
 	return file;

@@ -935,7 +935,7 @@ static int dsi_panel_update_backlight(struct dsi_panel *panel,
 		}
 
 		rc = mipi_dsi_dcs_set_display_brightness_samsung(dsi, bl_lvl);
-		pr_err("backlight = %d\n", bl_lvl);
+		pr_debug("backlight = %d\n", bl_lvl);
 		cur_backlight = bl_lvl;
 		cur_fps = mode_fps;
 		cur_h = panel->cur_mode->timing.h_active;
@@ -965,6 +965,10 @@ int dsi_panel_op_set_hbm_mode(struct dsi_panel *panel, int level)
 	mutex_lock(&panel->panel_lock);
 
 	mode = panel->cur_mode;
+	if (panel->hbm_mode == 5) {
+		level = 1;
+	}
+
 	switch (level) {
 	case 0:
 		count = mode->priv_info->cmd_sets[DSI_CMD_SET_HBM_OFF].count;
@@ -5082,6 +5086,7 @@ bool real_aod_mode;
 
 extern bool oneplus_dimlayer_hbm_enable;
 bool backup_dimlayer_hbm = false;
+extern int oneplus_auth_status;
 extern int oneplus_dim_status;
 int backup_dim_status = 0;
 int dsi_panel_enable(struct dsi_panel *panel)
@@ -5130,9 +5135,18 @@ int dsi_panel_enable(struct dsi_panel *panel)
 	oneplus_panel_status = 2; // DISPLAY_POWER_ON
 	pr_err("dsi_panel_enable aod_mode =%d\n",panel->aod_mode);
 
+	if (oneplus_auth_status == 2) {
+		backup_dimlayer_hbm = 0;
+		backup_dim_status = 0;
+	} else if (oneplus_auth_status == 1) {
+		backup_dimlayer_hbm = 1;
+		backup_dim_status = 1;
+	}
 	oneplus_dimlayer_hbm_enable = backup_dimlayer_hbm;
 	oneplus_dim_status = backup_dim_status;
-	pr_err("Restore dim when panel goes on");
+	if (oneplus_auth_status != 2)
+		pr_err("Restore dim when panel goes on");
+	oneplus_auth_status = 0;
 
 	blank = MSM_DRM_BLANK_UNBLANK_CHARGE;
 	notifier_data.data = &blank;
@@ -5145,8 +5159,6 @@ int dsi_panel_enable(struct dsi_panel *panel)
 	}
 	mutex_unlock(&panel->panel_lock);
 	pr_err("end\n");
-	/* remove print actvie ws */
-	pm_print_active_wakeup_sources_queue(false);
 
 	return rc;
 }
@@ -5250,8 +5262,6 @@ int dsi_panel_disable(struct dsi_panel *panel)
 	oneplus_panel_status = 0; // DISPLAY_POWER_OFF
 
 	mutex_unlock(&panel->panel_lock);
-	/* add print actvie ws */
-	pm_print_active_wakeup_sources_queue(true);
 	printk(KERN_ERR"dsi_panel_disable --\n");
 	return rc;
 }

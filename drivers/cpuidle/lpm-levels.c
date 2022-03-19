@@ -26,6 +26,7 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/tick.h>
+#include <linux/wakeup_reason.h>
 #include <linux/suspend.h>
 #include <linux/pm_qos.h>
 #include <linux/of_platform.h>
@@ -54,14 +55,13 @@
 #endif /* CONFIG_COMMON_CLK */
 #define CREATE_TRACE_POINTS
 #include <trace/events/trace_msm_low_power.h>
-#ifdef CONFIG_CONTROL_CENTER
-#include <oneplus/control_center/control_center_helper.h>
-#endif
 
 #define SCLK_HZ (32768)
 #define PSCI_POWER_STATE(reset) (reset << 30)
 #define PSCI_AFFINITY_LEVEL(lvl) ((lvl & 0x3) << 24)
 #define BIAS_HYST (bias_hyst * NSEC_PER_MSEC)
+
+#define MAX_S2IDLE_CPU_ATTEMPTS  32   /* divide by # cpus for max suspends */
 
 enum {
 	MSM_LPM_LVL_DBG_SUSPEND_LIMITS = BIT(0),
@@ -141,12 +141,6 @@ module_param_named(print_parsed_dt, print_parsed_dt, bool, 0664);
 
 static bool sleep_disabled;
 module_param_named(sleep_disabled, sleep_disabled, bool, 0664);
-
-void msm_cpuidle_set_sleep_disable(bool disable)
-{
-	sleep_disabled = disable;
-	pr_info("%s:sleep_disabled=%d\n", __func__, disable);
-}
 
 /**
  * msm_cpuidle_get_deep_idle_latency - Get deep idle latency value
@@ -689,45 +683,6 @@ static inline bool is_cpu_biased(int cpu, uint64_t *bias_time)
 	return false;
 }
 
-#ifdef CONFIG_CONTROL_CENTER
-static inline bool lpm_disallowed(s64 sleep_us, int cpu, struct lpm_cpu *pm_cpu)
-{
-	uint64_t bias_time = 0;
-
-#ifdef CONFIG_CONTROL_CENTER
-	uint64_t tb_block_ts;
-	int tb_ccdm_idx = cpu + CCDM_TB_CPU_0_IDLE_BLOCK;
-#endif
-
-	if (cpu_isolated(cpu))
-		goto out;
-
-	if (sleep_disabled)
-		return true;
-
-	bias_time = sched_lpm_disallowed_time(cpu);
-	if (bias_time) {
-		pm_cpu->bias = bias_time;
-		return true;
-	}
-
-#ifdef CONFIG_CONTROL_CENTER
-	tb_block_ts = ccdm_get_hint(tb_ccdm_idx);
-	if (!time_after64(get_jiffies_64(), tb_block_ts))
-		return true;
-#endif
-
-out:
-#ifdef CONFIG_CONTROL_CENTER
-	ccdm_update_hint_1(tb_ccdm_idx, ULLONG_MAX);
-#endif
-	if (sleep_us < 0)
-		return true;
-
-	return false;
-}
-#endif
-
 static int cpu_power_select(struct cpuidle_device *dev,
 		struct lpm_cpu *cpu)
 {
@@ -747,15 +702,11 @@ static int cpu_power_select(struct cpuidle_device *dev,
 	struct power_params *pwr_params;
 	uint64_t bias_time = 0;
 
-#ifdef CONFIG_CONTROL_CENTER
-	if (lpm_disallowed(sleep_us, dev->cpu, cpu))
-		goto done_select;
-#else
 	if ((sleep_disabled && !cpu_isolated(dev->cpu)) || sleep_us < 0)
 		return best_level;
-#endif
 
 	idx_restrict = cpu->nlevels + 1;
+
 	next_event_us = (uint32_t)(ktime_to_us(get_next_event_time(dev->cpu)));
 
 	if (is_cpu_biased(dev->cpu, &bias_time) && (!cpu_isolated(dev->cpu))) {
@@ -1584,6 +1535,10 @@ exit:
 static void lpm_cpuidle_s2idle(struct cpuidle_device *dev,
 		struct cpuidle_driver *drv, int idx)
 {
+	static DEFINE_SPINLOCK(s2idle_lock);
+	static struct cpumask idling_cpus;
+	static s2idle_sleep_attempts;
+	static bool s2idle_aborted;
 	struct lpm_cpu *cpu = per_cpu(cpu_lpm, dev->cpu);
 	const struct cpumask *cpumask = get_cpu_mask(dev->cpu);
 	bool success = false;
@@ -1597,6 +1552,28 @@ static void lpm_cpuidle_s2idle(struct cpuidle_device *dev,
 		return;
 	}
 
+	spin_lock(&s2idle_lock);
+	if (cpumask_empty(&idling_cpus)) {
+		s2idle_sleep_attempts = 0;
+		s2idle_aborted = false;
+	} else if (s2idle_aborted) {
+		spin_unlock(&s2idle_lock);
+		return;
+	}
+
+	cpumask_or(&idling_cpus, &idling_cpus, cpumask);
+	if (++s2idle_sleep_attempts > MAX_S2IDLE_CPU_ATTEMPTS) {
+		s2idle_aborted = true;
+	}
+	spin_unlock(&s2idle_lock);
+
+	if (s2idle_aborted) {
+		pr_err("Aborting s2idle suspend: too many iterations\n");
+		log_abnormal_wakeup_reason("s2idle soft watchdog");
+		pm_system_wakeup();
+		goto exit;
+	}
+
 	cpu_prepare(cpu, idx, true);
 	cluster_prepare(cpu->parent, cpumask, idx, false, 0);
 
@@ -1604,6 +1581,11 @@ static void lpm_cpuidle_s2idle(struct cpuidle_device *dev,
 
 	cluster_unprepare(cpu->parent, cpumask, idx, false, 0, success);
 	cpu_unprepare(cpu, idx, true);
+
+exit:
+	spin_lock(&s2idle_lock);
+	cpumask_andnot(&idling_cpus, &idling_cpus, cpumask);
+	spin_unlock(&s2idle_lock);
 }
 
 #ifdef CONFIG_CPU_IDLE_MULTIPLE_DRIVERS
